@@ -36,6 +36,8 @@ The following configuration options are available:
 | manageCallbacks | Let the Nuki Binding manage the callbacks on the Nuki Bridge. It will add the required callback on the Nuki Bridge. If there are already 3 callbacks, it **will delete** the callback with ID `0`. | Default true |
 | secureToken     | Whether hashed token should be used when communicating with Nuki Bridge. If disabled, API token will be sent in plaintext with each request.                                                       | Default true |
 
+Bridge requests have a finite timeout: 10 seconds for bridge info, the device list and callbacks, and 45 seconds for lock actions and direct lock-state reads. The bridge HTTP API handles one request at a time, so the binding sends those calls one after another. A call that never returns is aborted when its timeout elapses, and disposing the bridge does not wait for it. Lock commands therefore cannot queue behind a hung bridge request until openHAB is restarted.
+
 ### Bridge discovery
 
 Bridges on local network can be discovered automatically if both Nuki Bridge and openHAB have working internet connection. You can check whether discovery
