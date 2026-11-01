@@ -18,6 +18,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -57,12 +58,14 @@ import org.slf4j.LoggerFactory;
  * The {@link AbstractNukiDeviceHandler} is a base class for implementing ThingHandlers for Nuki devices
  *
  * @author Jan Vybíral - Initial contribution
+ * @author Reto Hui - Ignore bridge calls after the handler is disposed
  */
 @NonNullByDefault
 public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguration> extends BaseThingHandler {
 
     protected final Logger logger = LoggerFactory.getLogger(getClass());
     private static final int JOB_INTERVAL = 60;
+    private static final int INACTIVE_EPOCH = -1;
     private static final Pattern NUKI_ID_HEX_PATTERN = Pattern.compile("[A-F\\d]*[A-F]+[A-F\\d]*",
             Pattern.CASE_INSENSITIVE);
 
@@ -72,6 +75,9 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
     @Nullable
     private NukiHttpClient nukiHttpClient;
     protected final boolean readOnly;
+    private final AtomicInteger epochSequence = new AtomicInteger();
+    private final ThreadLocal<@Nullable Integer> operationEpoch = new ThreadLocal<>();
+    private volatile int activeEpoch = INACTIVE_EPOCH;
 
     public AbstractNukiDeviceHandler(Thing thing, boolean readOnly) {
         super(thing);
@@ -91,13 +97,53 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
     }
 
     protected <U> U withHttpClient(Function<NukiHttpClient, U> consumer, U defaultValue) {
+        if (!isCallActive()) {
+            logger.debug("Ignoring request for {} because the handler is not active", thing.getUID());
+            return defaultValue;
+        }
         NukiHttpClient client = this.nukiHttpClient;
         if (client == null) {
-            logger.warn("Nuki HTTP client is null. This is a bug in Nuki Binding, please report it",
-                    new IllegalStateException());
+            logger.warn("Nuki HTTP client is not available for {}", thing.getUID());
             return defaultValue;
         } else {
             return consumer.apply(client);
+        }
+    }
+
+    private boolean isActive(int epoch) {
+        return epoch != INACTIVE_EPOCH && epoch == activeEpoch;
+    }
+
+    /**
+     * @return {@code false} when this handler was disposed, or when the scheduled task belongs to a previous
+     *         initialize/dispose cycle. The same handler instance is initialized again after dispose.
+     */
+    private boolean isCallActive() {
+        @Nullable
+        Integer epoch = operationEpoch.get();
+        if (epoch != null) {
+            return isActive(epoch.intValue());
+        }
+        return activeEpoch != INACTIVE_EPOCH;
+    }
+
+    private void runEpoch(int epoch, Runnable action) {
+        if (!isActive(epoch)) {
+            return;
+        }
+        operationEpoch.set(epoch);
+        try {
+            if (!isActive(epoch)) {
+                return;
+            }
+            action.run();
+        } finally {
+            operationEpoch.remove();
+            // A cancelled task may have been interrupted while blocked in a bridge request. Clear that flag so the
+            // shared scheduler thread is not left interrupted for the next task.
+            if (!isActive(epoch) && Thread.interrupted()) {
+                logger.trace("Cleared interrupt after cancelled task for {}", thing.getUID());
+            }
         }
     }
 
@@ -127,19 +173,26 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
 
     @Override
     public void initialize() {
+        final int epoch = epochSequence.incrementAndGet();
+        activeEpoch = epoch;
         this.configuration = getConfigAs(getConfigurationClass());
         if (migrateConfiguration()) {
             this.configuration = getConfigAs(getConfigurationClass());
         }
-        scheduler.execute(this::initializeHandler);
+        scheduler.execute(() -> runEpoch(epoch, this::initializeDevice));
     }
 
     @Override
     public void dispose() {
+        activeEpoch = INACTIVE_EPOCH;
         stopReInitJob();
+        nukiHttpClient = null;
     }
 
-    private void initializeHandler() {
+    private void initializeDevice() {
+        if (!isCallActive()) {
+            return;
+        }
         Bridge bridge = getBridge();
         if (bridge == null) {
             logger.debug("Bridge unavailable while initializing Thing: {}", thing.getUID());
@@ -150,12 +203,24 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
     }
 
     private void initializeHandler(@Nullable ThingHandler handler, @Nullable ThingStatus bridgeStatus) {
+        if (!isCallActive()) {
+            return;
+        }
         if (handler instanceof NukiBridgeHandler bridgeHandler && bridgeStatus != null) {
             if (bridgeStatus == ThingStatus.ONLINE) {
                 this.nukiHttpClient = bridgeHandler.getNukiHttpClient();
                 withHttpClient(client -> {
+                    if (!isCallActive()) {
+                        return;
+                    }
                     BridgeListResponse bridgeListResponse = client.getList();
+                    if (!isCallActive()) {
+                        return;
+                    }
                     if (handleResponse(bridgeListResponse, null, null)) {
+                        if (!isCallActive()) {
+                            return;
+                        }
                         BridgeApiListDeviceDto device = bridgeListResponse.getDevice(configuration.nukiId);
                         if (device == null) {
                             logger.warn("Configured Smart Lock [{}] not present in bridge device list",
@@ -227,40 +292,48 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
 
     @Override
     public void bridgeStatusChanged(ThingStatusInfo bridgeStatusInfo) {
-        scheduler.execute(() -> {
+        final int epoch = activeEpoch;
+        scheduler.execute(() -> runEpoch(epoch, () -> {
             Bridge bridge = getBridge();
             if (bridge == null) {
                 initializeHandler(null, bridgeStatusInfo.getStatus());
             } else {
                 initializeHandler(bridge.getHandler(), bridgeStatusInfo.getStatus());
             }
-        });
+        }));
     }
 
     @Override
     public void handleCommand(ChannelUID channelUID, Command command) {
         logger.trace("handleCommand({}, {})", channelUID, command);
+        final int epoch = activeEpoch;
+        if (!isActive(epoch)) {
+            return;
+        }
 
         if (getThing().getStatus() != ThingStatus.ONLINE) {
             logger.debug("Thing is not ONLINE; command[{}] for channelUID[{}] is ignored", command, channelUID);
         } else if (command instanceof RefreshType) {
-            scheduler.execute(() -> {
+            scheduler.execute(() -> runEpoch(epoch, () -> {
                 withHttpClient(client -> {
                     BridgeLockStateResponse bridgeLockStateResponse = client.getBridgeLockState(configuration.nukiId,
                             getDeviceType());
+                    if (!isCallActive()) {
+                        return;
+                    }
                     if (handleResponse(bridgeLockStateResponse, channelUID.getAsString(), command.toString())) {
                         if (!doHandleRefreshCommand(channelUID, command, bridgeLockStateResponse)) {
                             logger.debug("Command[{}] for channelUID[{}] not implemented!", command, channelUID);
                         }
                     }
                 });
-            });
+            }));
         } else {
-            scheduler.execute(() -> {
+            scheduler.execute(() -> runEpoch(epoch, () -> {
                 if (!doHandleCommand(channelUID, command)) {
                     logger.debug("Unexpected command[{}] for channelUID[{}]!", command, channelUID);
                 }
-            });
+            }));
         }
     }
 
@@ -302,6 +375,9 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
 
     protected boolean handleResponse(NukiBaseResponse nukiBaseResponse, @Nullable String channelUID,
             @Nullable String command) {
+        if (!isCallActive()) {
+            return false;
+        }
         if (nukiBaseResponse.getStatus() == 200 && nukiBaseResponse.isSuccess()) {
             logger.debug("Command[{}] succeeded for channelUID[{}] on nukiId[{}]!", command, channelUID,
                     configuration.nukiId);
@@ -325,31 +401,44 @@ public abstract class AbstractNukiDeviceHandler<T extends NukiDeviceConfiguratio
         updateState(NukiBindingConstants.CHANNEL_SMARTLOCK_DOOR_STATE, NukiBindingConstants.DOORSENSOR_STATES_UNKNOWN,
                 DecimalType::new);
 
-        withBridgeAsync(bridge -> {
+        @Nullable
+        Integer epoch = operationEpoch.get();
+        if (epoch == null || !isActive(epoch.intValue())) {
+            return false;
+        }
+        int capturedEpoch = epoch.intValue();
+        withBridgeAsync(capturedEpoch, bridge -> {
             bridge.checkBridgeOnline();
-            startReInitJob();
+            startReInitJob(capturedEpoch);
         });
         return false;
     }
 
-    private void withBridgeAsync(Consumer<NukiBridgeHandler> handler) {
+    private void withBridgeAsync(int epoch, Consumer<NukiBridgeHandler> handler) {
+        if (!isActive(epoch)) {
+            return;
+        }
         Bridge bridge = getBridge();
         if (bridge != null) {
             BridgeHandler bridgeHandler = bridge.getHandler();
             if (bridgeHandler instanceof NukiBridgeHandler nukiBridgeHandler) {
-                scheduler.execute(() -> handler.accept(nukiBridgeHandler));
+                scheduler.execute(() -> runEpoch(epoch, () -> handler.accept(nukiBridgeHandler)));
             }
         }
     }
 
-    private void startReInitJob() {
+    private void startReInitJob(int epoch) {
         logger.trace("Starting reInitJob with interval of  {}secs for Smart Lock[{}].", JOB_INTERVAL,
                 configuration.nukiId);
+        if (!isActive(epoch)) {
+            return;
+        }
         if (reInitJob != null) {
             logger.trace("Already started reInitJob for Smart Lock[{}].", configuration.nukiId);
             return;
         }
-        reInitJob = scheduler.scheduleWithFixedDelay(this::initializeHandler, 1, JOB_INTERVAL, TimeUnit.SECONDS);
+        reInitJob = scheduler.scheduleWithFixedDelay(() -> runEpoch(epoch, this::initializeDevice), 1, JOB_INTERVAL,
+                TimeUnit.SECONDS);
     }
 
     private void stopReInitJob() {
