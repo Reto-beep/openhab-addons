@@ -17,8 +17,10 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -54,20 +56,33 @@ import org.slf4j.LoggerFactory;
  *
  * @author Markus Katter - Initial contribution
  * @author Jan Vybíral - Improved callback handling
+ * @author Reto Hui - Abort hung bridge requests on dispose
  */
 @NonNullByDefault
 public class NukiBridgeHandler extends BaseBridgeHandler {
 
     private final Logger logger = LoggerFactory.getLogger(NukiBridgeHandler.class);
     private static final int JOB_INTERVAL = 600;
+    private static final int INACTIVE_EPOCH = -1;
+    /** How long disposal waits for an in-flight request to abort before skipping callback removal. */
+    private static final long DISPOSE_LOCK_WAIT_MS = 500;
+    /**
+     * Per-request timeout while removing the callback during disposal. Two calls at this limit stay under the
+     * framework warning for a dispose that takes longer than 5 seconds.
+     */
+    private static final long DISPOSE_REQUEST_TIMEOUT_MS = 1_500;
 
     private final HttpClient httpClient;
+    private final AtomicInteger epochSequence = new AtomicInteger();
     @Nullable
     private NukiHttpClient nukiHttpClient;
     @Nullable
     private final String callbackUrl;
     @Nullable
+    private Future<?> initializeFuture;
+    @Nullable
     private ScheduledFuture<?> checkBridgeOnlineJob;
+    private volatile int activeEpoch = INACTIVE_EPOCH;
     private NukiBridgeConfiguration config = new NukiBridgeConfiguration();
 
     public NukiBridgeHandler(Bridge bridge, HttpClient httpClient, @Nullable String callbackUrl) {
@@ -89,18 +104,27 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
     }
 
     protected <@Nullable U> @Nullable U withHttpClient(Function<NukiHttpClient, U> consumer, U defaultValue) {
+        if (activeEpoch == INACTIVE_EPOCH) {
+            logger.debug("Bridge {} is not active; skipping HTTP call", getThing().getUID());
+            return defaultValue;
+        }
         NukiHttpClient client = this.nukiHttpClient;
         if (client == null) {
-            logger.warn("Nuki HTTP client is null. This is a bug in Nuki Binding, please report it",
-                    new IllegalStateException());
+            logger.warn("Nuki HTTP client is not available for bridge {}", getThing().getUID());
             return defaultValue;
         } else {
             return consumer.apply(client);
         }
     }
 
+    private boolean isActive(int epoch) {
+        return epoch != INACTIVE_EPOCH && epoch == activeEpoch;
+    }
+
     @Override
     public void initialize() {
+        final int epoch = epochSequence.incrementAndGet();
+        activeEpoch = epoch;
         this.config = getConfigAs(NukiBridgeConfiguration.class);
         String ip = config.ip;
         Integer port = config.port;
@@ -117,9 +141,9 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
         } else {
             NukiLinkBuilder linkBuilder = new NukiLinkBuilder(ip, port, apiToken, this.config.secureToken);
             nukiHttpClient = new NukiHttpClient(httpClient, linkBuilder);
-            scheduler.execute(this::initializeHandler);
-            checkBridgeOnlineJob = scheduler.scheduleWithFixedDelay(this::checkBridgeOnline, JOB_INTERVAL, JOB_INTERVAL,
-                    TimeUnit.SECONDS);
+            initializeFuture = scheduler.submit(() -> initializeHandler(epoch));
+            checkBridgeOnlineJob = scheduler.scheduleWithFixedDelay(() -> checkBridgeOnline(epoch), JOB_INTERVAL,
+                    JOB_INTERVAL, TimeUnit.SECONDS);
         }
     }
 
@@ -131,15 +155,28 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
     @Override
     public void dispose() {
         logger.debug("dispose() for Bridge[{}].", getThing().getUID());
-        if (this.config.manageCallbacks) {
-            unregisterCallback();
+        // Invalidate queued initialize/online tasks before touching the client. The same handler instance is
+        // initialized again after dispose when the thing configuration changes.
+        activeEpoch = INACTIVE_EPOCH;
+        Future<?> initializeTask = initializeFuture;
+        if (initializeTask != null) {
+            initializeTask.cancel(true);
         }
-        nukiHttpClient = null;
+        initializeFuture = null;
         ScheduledFuture<?> job = checkBridgeOnlineJob;
         if (job != null) {
             job.cancel(true);
         }
         checkBridgeOnlineJob = null;
+        NukiHttpClient client = nukiHttpClient;
+        if (client != null) {
+            if (this.config.manageCallbacks) {
+                client.closeAfter(DISPOSE_LOCK_WAIT_MS, DISPOSE_REQUEST_TIMEOUT_MS, this::unregisterCallback);
+            } else {
+                client.close();
+            }
+        }
+        nukiHttpClient = null;
     }
 
     @Override
@@ -147,9 +184,18 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
         return Set.of(NukiDeviceDiscoveryService.class);
     }
 
-    private synchronized void initializeHandler() {
+    private synchronized void initializeHandler(int epoch) {
+        if (!isActive(epoch)) {
+            return;
+        }
         withHttpClient(client -> {
+            if (!isActive(epoch)) {
+                return;
+            }
             BridgeInfoResponse bridgeInfoResponse = client.getBridgeInfo();
+            if (!isActive(epoch)) {
+                return;
+            }
             if (bridgeInfoResponse.getStatus() == HttpStatus.OK_200) {
                 updateProperty(NukiBindingConstants.PROPERTY_FIRMWARE_VERSION, bridgeInfoResponse.getFirmwareVersion());
                 updateProperty(NukiBindingConstants.PROPERTY_WIFI_FIRMWARE_VERSION,
@@ -174,11 +220,24 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
     }
 
     public void checkBridgeOnline() {
+        checkBridgeOnline(activeEpoch);
+    }
+
+    private void checkBridgeOnline(int epoch) {
+        if (!isActive(epoch)) {
+            return;
+        }
         logger.debug("checkBridgeOnline():bridgeIp[{}] status[{}]", this.config.ip, getThing().getStatus());
         if (getThing().getStatus().equals(ThingStatus.ONLINE)) {
             withHttpClient(client -> {
+                if (!isActive(epoch)) {
+                    return;
+                }
                 logger.debug("Requesting BridgeInfo to ensure Bridge[{}] is online.", this.config.ip);
                 BridgeInfoResponse bridgeInfoResponse = client.getBridgeInfo();
+                if (!isActive(epoch)) {
+                    return;
+                }
                 int status = bridgeInfoResponse.getStatus();
                 if (status == HttpStatus.OK_200) {
                     logger.debug("Bridge[{}] responded with status[{}]. Bridge is online.", this.config.ip, status);
@@ -194,11 +253,14 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
                 }
             });
         } else {
-            initializeHandler();
+            initializeHandler(epoch);
         }
     }
 
     private boolean isHttpClientNull() {
+        if (activeEpoch == INACTIVE_EPOCH) {
+            return true;
+        }
         NukiHttpClient httpClient = getNukiHttpClient();
         if (httpClient == null) {
             logger.debug("HTTP Client not configured, switching bridge to OFFLINE");
@@ -279,14 +341,28 @@ public class NukiBridgeHandler extends BaseBridgeHandler {
         });
     }
 
+    /**
+     * Removes this bridge's callback. Talks to the HTTP client directly so it still runs during {@link #dispose()},
+     * after the handler epoch has been invalidated and {@link #withHttpClient} no longer accepts calls.
+     */
     private void unregisterCallback() {
-        List<BridgeApiCallbackListCallbackDto> callbacks = listCallbacks();
-        if (callbacks == null) {
+        NukiHttpClient client = nukiHttpClient;
+        String callback = callbackUrl;
+        if (client == null || callback == null) {
             return;
         }
-
-        callbacks.stream().filter(callback -> callback.getUrl().equals(callbackUrl))
-                .map(BridgeApiCallbackListCallbackDto::getId)
-                .forEach(callbackId -> withHttpClient(client -> client.getBridgeCallbackRemove(callbackId)));
+        BridgeCallbackListResponse bridgeCallbackListResponse = client.getBridgeCallbackList();
+        if (!bridgeCallbackListResponse.isSuccess()) {
+            logger.debug("Failed to list callbacks while disposing Bridge[{}] - status {}, message {}", config.ip,
+                    bridgeCallbackListResponse.getStatus(), bridgeCallbackListResponse.getMessage());
+            return;
+        }
+        bridgeCallbackListResponse.getCallbacks().stream().filter(entry -> callback.equals(entry.getUrl()))
+                .map(BridgeApiCallbackListCallbackDto::getId).forEach(callbackId -> {
+                    BridgeCallbackRemoveResponse removeResponse = client.getBridgeCallbackRemove(callbackId);
+                    if (removeResponse.getStatus() == HttpStatus.OK_200) {
+                        logger.debug("Successfully removed callbackUrl[{}] on Bridge[{}]!", callback, config.ip);
+                    }
+                });
     }
 }
